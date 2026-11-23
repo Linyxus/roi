@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
@@ -67,6 +69,10 @@ type Server struct {
 	cfg  Config
 	host string
 	home string
+
+	modes  sync.Map // agent id -> permission mode last read off its screen
+	cycles sync.Map // agent id -> the modes it offers, once a switch has gone all the way round
+	modeMu sync.Mutex
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -154,6 +160,21 @@ func (s *Server) Handler() http.Handler {
 		if a.State == "need" {
 			out["prompt"] = s.hub.BuildPrompt(a)
 		}
+		if a.Kind == "claude" {
+			// The screen has the mode as it is now; a prompt can cover the
+			// footer, so the last one read is kept.
+			if screen, err := s.rex.screenText(a.Session, a.block, 6); err == nil {
+				if m := screenMode(screen); m != "" {
+					s.modes.Store(a.ID, m)
+				}
+			}
+			if m, ok := s.modes.Load(a.ID); ok {
+				out["mode"] = m
+			}
+			if c, ok := s.cycles.Load(a.ID); ok {
+				out["modes"] = c
+			}
+		}
 		if a.State == "done" && !a.Unread {
 			a.State = "idle"
 		}
@@ -161,7 +182,7 @@ func (s *Server) Handler() http.Handler {
 		// One stamp covers everything the session view shows.
 		pb, _ := json.Marshal(out["prompt"])
 		ab, _ := json.Marshal(a)
-		stamp := fmt.Sprintf("%s|%d|%s|%s", a.tr.pathOrEmpty(), rev, ab, pb)
+		stamp := fmt.Sprintf("%s|%d|%s|%s|%v", a.tr.pathOrEmpty(), rev, ab, pb, out["mode"])
 		out["stamp"] = fnv(stamp)
 		if r.URL.Query().Get("stamp") == out["stamp"] {
 			writeJSON(w, map[string]any{"unchanged": true})
@@ -190,6 +211,62 @@ func (s *Server) Handler() http.Handler {
 		s.hub.MarkSeen(a.ID)
 		s.hub.Nudge(a)
 		writeJSON(w, map[string]bool{"ok": true})
+	}))
+
+	// Claude Code only has a key that steps to the next mode, so choosing a
+	// mode means pressing it until the screen shows the one asked for.
+	mux.HandleFunc("POST /api/agents/{id}/mode", agent(func(w http.ResponseWriter, r *http.Request, a Agent) {
+		var b struct {
+			Mode string `json:"mode"`
+		}
+		known := []string{"default", "acceptEdits", "plan", "auto", "bypassPermissions"}
+		if err := readBody(r, &b); err != nil || !slices.Contains(known, b.Mode) || a.Kind != "claude" {
+			fail(w, 400, errors.New("no such mode"))
+			return
+		}
+		s.modeMu.Lock()
+		defer s.modeMu.Unlock()
+		read := func() string {
+			screen, err := s.rex.screenText(a.Session, a.block, 6)
+			if err != nil {
+				return ""
+			}
+			return screenMode(screen)
+		}
+		cur := read()
+		if cur == "" {
+			fail(w, 409, errors.New("the agent's screen is not showing its mode right now; try again in a moment"))
+			return
+		}
+		seen := []string{cur}
+		for cur != b.Mode {
+			if err := s.rex.keys(a.Session, a.block, "shift+tab"); err != nil {
+				fail(w, 502, err)
+				return
+			}
+			next := ""
+			for i := 0; i < 20 && next == ""; i++ {
+				time.Sleep(60 * time.Millisecond)
+				if m := read(); m != cur {
+					next = m
+				}
+			}
+			if next == "" {
+				s.modes.Store(a.ID, cur)
+				fail(w, 502, errors.New("the agent did not switch modes"))
+				return
+			}
+			cur = next
+			s.modes.Store(a.ID, cur)
+			if slices.Contains(seen, cur) { // all the way round without finding it
+				s.cycles.Store(a.ID, seen)
+				fail(w, 409, errors.New("this agent does not offer that mode"))
+				return
+			}
+			seen = append(seen, cur)
+		}
+		s.modes.Store(a.ID, cur)
+		writeJSON(w, map[string]string{"mode": cur})
 	}))
 
 	mux.HandleFunc("POST /api/agents/{id}/key", agent(func(w http.ResponseWriter, r *http.Request, a Agent) {

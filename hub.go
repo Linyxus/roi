@@ -560,6 +560,22 @@ var optRe = regexp.MustCompile(`^[\s│|┃]*([❯>›▶➤●])?\s*(\d{1,2})[.
 
 // parseOptions finds the numbered choices a terminal prompt is showing: the
 // last run of lines numbered 1, 2, 3… near the bottom of the screen.
+var modeRe = regexp.MustCompile(`(bypass permissions|accept edits|plan mode|auto mode|manual mode) on\b`)
+
+// screenMode reads Claude Code's permission mode off the footer of its
+// screen, or returns "" when the footer is not showing. The session file
+// records the mode only when a turn starts, so a switch shows here first.
+func screenMode(screen string) string {
+	lines := strings.Split(screen, "\n")
+	for i := len(lines) - 1; i >= 0 && i >= len(lines)-6; i-- {
+		if m := modeRe.FindStringSubmatch(lines[i]); m != nil {
+			return map[string]string{"bypass permissions": "bypassPermissions", "accept edits": "acceptEdits",
+				"plan mode": "plan", "auto mode": "auto", "manual mode": "default"}[m[1]]
+		}
+	}
+	return ""
+}
+
 func parseOptions(screen string) []PromptOption {
 	lines := strings.Split(lastLines(screen, 45), "\n")
 	var best, cur []PromptOption

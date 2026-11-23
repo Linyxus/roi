@@ -299,3 +299,19 @@ func TestConfig(t *testing.T) {
 		t.Errorf("a broken file should be reported and defaults used: %+v, %v", c, err)
 	}
 }
+
+func TestScreenMode(t *testing.T) {
+	for foot, want := range map[string]string{
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent":  "bypassPermissions",
+		"  ⏵⏵ auto mode on (shift+tab to cycle)":                       "auto",
+		"  ⏸ manual mode on · ← 1 agent":                               "default",
+		"  ⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt": "acceptEdits",
+		"  ⏸ plan mode on (shift+tab to cycle)":                        "plan",
+		"  ❯ 1. Yes": "",
+	} {
+		screen := "turn plan mode on for this\n\n\n\n\n❯ \n────\n  📁 roi • ⚡ Fable\n" + foot
+		if got := screenMode(screen); got != want {
+			t.Errorf("screenMode(%q) = %q, want %q", foot, got, want)
+		}
+	}
+}

@@ -8,7 +8,7 @@ const S = {
   detail: null,        // last /api/agents/:id payload
   stamp: '',
   open: new Set(),     // expanded step groups, steps and diffs
-  dockKey: '', showKeys: false, missing: 0,
+  inboxTop: 0, inboxChips: 0, dockKey: '', showKeys: false, modeMenu: false, modeBusy: false, missing: 0,
   term: { fit: true, ctrl: false, alt: false, cols: 80 },
   form: null, settings: null,
 };
@@ -29,7 +29,29 @@ const I = {
   folder: sv('<path d="M3.5 7.5a2 2 0 012-2h3.6l2 2.3h7.4a2 2 0 012 2v7.2a2 2 0 01-2 2h-13a2 2 0 01-2-2z"/>', 20),
   up: sv('<path d="M12 19V5M6 11l6-6 6 6"/>', 18),
   keys: sv('<rect x="3" y="6.5" width="18" height="11" rx="2.5"/><path d="M7 10.5h.01M11 10.5h.01M15 10.5h.01M8 14h8"/>'),
+  pick: sv('<path d="M8 9.5l4-4 4 4M8 14.5l4 4 4-4"/>', 16),
+  badge: sv('<path d="M5 12.5l4.5 4.5L19 7.5"/>', 10, 3.4),
+  shield: sv('<path d="M12 3l7 3v5.5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z"/>', 16, 2),
+  ask: sv('<path d="M9 9.2a3 3 0 115 2.2c-.9.8-2 1.3-2 2.8M12 17.6h.01"/>', 16, 2),
 };
+
+// A project's hue and two-letter monogram, both derived from its name.
+// The hues skip the yellow-green range, which turns muddy at this lightness.
+const HUES = [10, 35, 60, 140, 160, 180, 200, 220, 240, 255, 270, 285, 300, 320, 340, 355];
+function hueOf(name) {
+  let h = 2166136261;
+  for (const c of String(name || '')) { h ^= c.codePointAt(0); h = Math.imul(h, 16777619); }
+  h ^= h >>> 15; h = Math.imul(h, 2246822507); h ^= h >>> 13;
+  return HUES[(h >>> 0) % HUES.length];
+}
+function monogram(name) {
+  const w = String(name || '').split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  return (w.length > 1 ? [...w[0]][0] + [...w[1]][0] : [...(w[0] || '?')].slice(0, 2).join('')).toUpperCase();
+}
+const avatar = (project, state, cls = '') => `<span class="av ${cls}">${esc(monogram(project))}${state ? `<span class="bd ${state}">${state === 'done' ? I.badge : state === 'working' ? '<i class="spin"></i>' : '<i></i>'}</span>` : ''}</span>`;
+const themeMeta = document.querySelector('meta[name="theme-color"]');
+// The browser's top bar takes the colour of the screen under it.
+const tint = () => { const v = $app.querySelector('.view'); if (v && themeMeta) themeMeta.content = getComputedStyle(v).backgroundColor; };
 
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Roi': '1' }, body: JSON.stringify(body) };
@@ -47,8 +69,19 @@ function ago(iso) {
   if (s < 86400) return Math.floor(s / 3600) + 'h';
   return Math.floor(s / 86400) + 'd';
 }
-const kindName = (k) => (k === 'codex' ? 'Codex' : 'Claude');
+function since(iso) {
+  if (!iso) return '';
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + ' min';
+  if (s < 86400) return Math.floor(s / 3600) + ' h';
+  return Math.floor(s / 86400) + ' d';
+}
+const kindName =(k) => (k === 'codex' ? 'Codex' : 'Claude');
 const stateName = { need: 'Waiting on you', done: 'Finished', working: 'Working', idle: 'Idle' };
+// The idle key row has six keys, so its mode button uses the short names.
+const modeShort = { default: 'Ask first', acceptEdits: 'Edits', plan: 'Plan', bypassPermissions: 'Bypass', auto: 'Auto' };
+const modeOrder = ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'];
 const modeName = { default: 'Ask first', acceptEdits: 'Auto-accept edits', plan: 'Plan mode', bypassPermissions: 'Bypass permissions', auto: 'Auto mode' };
 
 function toast(msg) {
@@ -126,12 +159,13 @@ function route() {
   if (p[0] === 'a' && p[1]) v = { name: p[2] === 'term' ? 'term' : 'session', id: p[1] };
   else if (p[0] === 'new') v = { name: 'new' };
   else if (p[0] === 'settings') v = { name: 'settings' };
+  saveInboxScroll();
   const changed = !S.view || S.view.name !== v.name || S.view.id !== v.id;
   S.view = v;
   clearInterval(pollTimer); pollTimer = null;
   if (v.name === 'inbox') renderInbox();
   if (v.name === 'session') {
-    if (changed) { S.detail = null; S.stamp = ''; S.dockKey = ''; S.missing = 0; S.showKeys = false; }
+    if (changed) { S.detail = null; S.stamp = ''; S.dockKey = ''; S.missing = 0; S.showKeys = false; S.modeMenu = S.modeBusy = false; }
     renderSession(true); loadDetail();
     pollTimer = setInterval(loadDetail, 1500);
   }
@@ -159,44 +193,56 @@ setInterval(() => { if (!S.online || document.visibilityState === 'visible') loa
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { loadAgents(); if (S.view?.name === 'session') loadDetail(); } });
 
 // ---------- inbox ----------
+// The inbox's own scroll position, kept while another screen is showing.
+function saveInboxScroll() {
+  const v = $app.querySelector('.inboxview');
+  if (v) { S.inboxTop = v.querySelector('.scroll').scrollTop; S.inboxChips = v.querySelector('.chips').scrollLeft; }
+}
 function renderInbox() {
-  const counts = { all: S.agents.length, need: 0, done: 0, working: 0 };
-  for (const a of S.agents) if (counts[a.state] !== undefined) counts[a.state]++;
-  const list = S.agents.filter((a) => S.filter === 'all' || a.state === S.filter);
-  const chip = (k, label) => `<button class="chip ${S.filter === k ? 'on' : ''}" data-act="filter" data-v="${k}">${label} ${counts[k]}</button>`;
-  const keep = $app.querySelector('.scroll')?.scrollTop || 0;
+  // Chips filter by project; the list itself is grouped by state.
+  const projects = new Map();
+  for (const a of S.agents) projects.set(a.project, (projects.get(a.project) || 0) + 1);
+  if (S.filter !== 'all' && !projects.has(S.filter)) S.filter = 'all';
+  const list = S.agents.filter((a) => S.filter === 'all' || a.project === S.filter);
+  const need = S.agents.filter((a) => a.state === 'need').length;
+  const chips = `<button class="chip ${S.filter === 'all' ? 'on' : ''}" data-act="filter" data-v="all">All <i>${S.agents.length}</i></button>`
+    + [...projects].sort((x, y) => y[1] - x[1] || String(x[0]).localeCompare(y[0])).map(([p, n]) => `<button class="chip hue ${S.filter === p ? 'on' : ''}" style="--h:${hueOf(p)}" data-act="filter" data-v="${esc(p)}"><span class="dot"></span>${esc(p)} <i>${n}</i></button>`).join('');
+  saveInboxScroll();
+  const keep = S.inboxTop, keepChips = S.inboxChips;
   let rows;
   if (!S.loaded) rows = `<div class="empty">${S.online === false && S.loaded === false ? 'Connecting to your Mac…' : ''}</div>`;
-  else if (!list.length) {
-    rows = S.filter === 'need' ? '<div class="empty"><b>Nothing needs you</b>Agents that stop for a permission or a question appear here.</div>'
-      : S.agents.length ? '<div class="empty">No agents in this state.</div>'
-      : '<div class="empty"><b>No agents running</b>Start one with the plus button, or open Claude Code or Codex in a Rex pane.</div>';
-  } else {
-    rows = list.map((a) => `
-      <button class="item ${a.state} ${a.state === 'need' || a.state === 'done' ? 'strong' : ''}" data-act="open" data-id="${esc(a.id)}">
-        <span class="mark ${a.state}"></span>
+  else if (!list.length) rows = '<div class="empty"><b>No agents running</b>Start one with the plus button, or open Claude Code or Codex in a Rex pane.</div>';
+  else {
+    rows = [['need', 'Needs you'], ['done', 'Finished'], ['working', 'Working'], ['idle', 'Idle']].map(([st, name]) => {
+      const xs = list.filter((a) => a.state === st);
+      if (!xs.length) return '';
+      return `<div class="sec ${st}">${name}<span>${xs.length}</span></div>` + xs.map((a) => `
+      <button class="item hue ${a.state}" style="--h:${hueOf(a.project)}" data-act="open" data-id="${esc(a.id)}">
+        ${avatar(a.project, a.state)}
         <span class="grow">
-          <span class="row" style="justify-content:space-between"><span class="t clip1">${esc(a.title)}</span><span class="time">${ago(a.updated)}</span></span>
-          <span class="l clip1" style="display:block">${esc(a.line)}</span>
-          <span class="p clip1" style="display:block">${esc(a.project)} · ${kindName(a.kind)}</span>
+          <span class="row"><span class="t clip1 grow">${esc(a.title)}</span><span class="time">${ago(a.updated)}</span></span>
+          <span class="l clip1"><b>${esc(a.project)}</b> ${esc(a.line)}</span>
         </span>
       </button>`).join('');
+    }).join('');
   }
   $app.innerHTML = `
-    <div class="view">
-      <div class="head">
-        <div class="row" style="justify-content:space-between">
+    <div class="view inboxview">
+      <div class="top">
+        <div class="hd">
           <h1>Agents</h1>
-          <button class="row hoststat" data-act="settings"><span class="mark ${S.online ? 'done' : 'need'}" style="width:7px;height:7px"></span>${S.online ? 'Mac online' : 'Mac unreachable'}</button>
+          <button class="hostbtn" data-act="settings"><span class="pill"><span class="dot" style="color:var(--${S.online ? 'done' : 'need'})"></span>${S.online ? 'Mac online' : 'Mac unreachable'}</span></button>
         </div>
-        <div class="chips">${chip('all', 'All')}${chip('need', 'Needs you')}${chip('done', 'Finished')}${chip('working', 'Working')}</div>
+        <div class="chips">${chips}</div>
       </div>
-      <div class="scroll" style="padding-bottom:96px">${rows}</div>
+      <div class="sheet"><div class="scroll" style="padding-bottom:104px">${rows}</div></div>
       <button class="fab" data-act="new" aria-label="New agent">${I.plus}</button>
     </div>`;
   $app.querySelector('.scroll').scrollTop = keep;
-  document.title = counts.need ? `(${counts.need}) roi` : 'roi';
-  if (navigator.setAppBadge) (counts.need ? navigator.setAppBadge(counts.need) : navigator.clearAppBadge()).catch(() => {});
+  $app.querySelector('.chips').scrollLeft = keepChips;
+  tint();
+  document.title = need ? `(${need}) roi` : 'roi';
+  if (navigator.setAppBadge) (need ? navigator.setAppBadge(need) : navigator.clearAppBadge()).catch(() => {});
 }
 
 // ---------- session ----------
@@ -236,9 +282,9 @@ function stepWord(items) {
 
 function renderDiff(t) {
   const d = t.diff, key = 'd:' + t.id, open = S.open.has(key);
-  const name = d.file.split('/').pop();
-  const body = open ? `<pre>${d.lines.map((l) => `<span class="${l[0] === '+' ? 'a' : l[0] === '-' ? 'd' : l === '@@' ? 'h' : ''}">${l === '@@' ? '⋯' : esc(l) || ' '}</span>`).join('')}${d.more ? `<span class="h">${d.more} more lines on the Mac</span>` : ''}</pre>` : '';
-  return `<div class="diff"><button class="diff-h" data-act="toggle" data-k="${esc(key)}"><span class="grow clip1">${esc(name)}</span><span class="plus">+${d.added}</span><span class="minus">−${d.removed}</span>${I.chev}</button>${body}</div>`;
+  const name = d.file.split('/').slice(-2).join('/');
+  const body = open ? `<pre>${d.lines.map((l) => `<span class="${l[0] === '+' ? 'a' : l[0] === '-' ? 'd' : l === '@@' ? 'h' : ''}">${l === '@@' ? '⋯' : esc(l ? l[0] + ' ' + l.slice(1) : ' ')}</span>`).join('')}${d.more ? `<span class="h">${d.more} more lines on the Mac</span>` : ''}</pre>` : '';
+  return `<div class="diff ${open ? 'open' : ''}"><button class="diff-h" data-act="toggle" data-k="${esc(key)}"><span class="grow clip1">${esc(name)}</span><span class="plus">+${d.added}</span><span class="minus">−${d.removed}</span>${I.chev}</button>${body}</div>`;
 }
 
 function renderGroup(tools, live) {
@@ -255,7 +301,7 @@ function renderGroup(tools, live) {
   h += '</div>';
   h += tools.filter((t) => t.diff).map(renderDiff).join('');
   const last = tools[tools.length - 1];
-  if (live && last.pending) h += `<div class="now"><span class="mark working"></span><span class="grow clip1">${esc(last.name === 'Bash' ? last.summary : `${last.name} ${last.summary || ''}`)}</span></div>`;
+  if (live && last.pending) h += `<div class="now"><i class="spin"></i><span class="grow clip1">${last.name === 'Bash' ? 'Running' : esc(last.name)} <b>${esc(last.summary || '')}</b></span></div>`;
   return h;
 }
 
@@ -294,24 +340,26 @@ function renderPanels(d) {
 
 function dockHTML(d) {
   const a = d.agent;
-  const mode = a.kind === 'claude' && d.mode ? `<button class="key ui" data-act="key" data-keys="shift+tab">${esc(modeName[d.mode] || d.mode)}</button>` : '';
+  const modes = d.modes?.length ? modeOrder.filter((m) => d.modes.includes(m)) : modeOrder;
+  const mode = a.kind === 'claude' && d.mode ? `<button class="key mode" data-act="mode-menu" aria-haspopup="menu" aria-expanded="${S.modeMenu}" ${S.modeBusy ? 'disabled' : ''}><span class="clip1">${S.modeBusy ? 'Switching…' : esc((a.state === 'working' ? modeName : modeShort)[d.mode] || d.mode)}</span>${S.modeBusy ? '<i class="spin"></i>' : I.pick}</button>` : '';
+  const menu = mode && S.modeMenu ? `<button class="shade" data-act="mode-close" aria-label="Close"></button><div class="menu" role="menu"><div class="label">Permission mode</div>${modes.map((m) => `<button class="mi ${m === d.mode ? 'on' : ''}" role="menuitemradio" aria-checked="${m === d.mode}" data-act="mode-set" data-v="${m}"><span class="grow">${modeName[m]}</span>${m === d.mode ? I.check : ''}</button>`).join('')}</div>` : '';
   if (a.state === 'need' && d.prompt) {
     const p = d.prompt;
     const opts = (p.options || []).map((o) => `<button class="opt" data-act="answer" data-n="${o.n}"><span class="num">${o.n}</span><span class="grow"><div class="ol">${esc(o.label)}</div>${o.description ? `<div class="od">${esc(o.description)}</div>` : ''}</span></button>`).join('');
     const fallback = opts ? '' : `<div class="hint" style="margin:10px 0">roi could not read the choices from the screen. Answer in the terminal.</div><button class="btn pri wide" data-act="term" style="margin-bottom:10px">${I.term} Open terminal</button>`;
     return `<div class="prompt">
-      <div class="k">${p.kind === 'question' ? 'Question' : p.kind === 'permission' ? 'Permission' : 'Waiting on you'}</div>
+      <div class="k">${p.kind === 'question' ? I.ask + 'Question' : p.kind === 'permission' ? I.shield + 'Permission' : 'Waiting on you'}</div>
       <div class="q">${esc(p.title)}</div>
       ${p.body ? `<div class="cmd">${esc(p.body)}</div>` : ''}
       <div class="opts ${esc(p.kind)}">${opts}</div>${fallback}
-      <div class="field"><textarea rows="1" placeholder="${p.kind === 'question' ? 'Something else' : 'Deny, and say what to do instead'}" data-role="answer"></textarea><button class="send" data-act="answer-text" aria-label="Send">${I.send}</button></div>
+      <div class="field"><textarea rows="1" placeholder="Or type a reply" data-role="answer"></textarea><button class="send" data-act="answer-text" aria-label="Send">${I.send}</button></div>
     </div>`;
   }
   const working = a.state === 'working';
   const keys = working
-    ? `<div class="keys"><button class="key ui" data-act="key" data-keys="escape">${I.stop} Stop</button><button class="key" data-act="key" data-keys="ctrl+c">⌃C</button>${mode}</div>`
+    ? `<div class="keys"><button class="key stop" data-act="key" data-keys="escape">${I.stop}Stop</button><button class="key" data-act="key" data-keys="ctrl+c">⌃C</button>${mode}</div>`
     : S.showKeys ? `<div class="keys"><button class="key" data-act="key" data-keys="escape">esc</button><button class="key" data-act="key" data-keys="ctrl+c">⌃C</button><button class="key" data-act="key" data-keys="up">↑</button><button class="key" data-act="key" data-keys="down">↓</button><button class="key" data-act="key" data-keys="enter">⏎</button>${mode}</div>` : '';
-  return `${keys}<div class="field"><textarea rows="1" placeholder="${working ? 'Steer it. Read at the next step' : 'Reply'}" data-role="send"></textarea>${working ? '' : `<button class="iconbtn" data-act="keys" aria-label="Keys" style="color:var(--ink2);width:40px">${I.keys}</button>`}<button class="send" data-act="send" aria-label="Send">${I.send}</button></div>`;
+  return `${menu}${keys}<div class="field"><textarea rows="1" placeholder="${working ? 'Steer it. Read at the next step' : 'Reply'}" data-role="send"></textarea>${working ? '' : `<button class="iconbtn" data-act="keys" aria-label="Keys" style="color:var(--ink2);width:40px">${I.keys}</button>`}<button class="send" data-act="send" aria-label="Send">${I.send}</button></div>`;
 }
 
 function renderSession(fresh) {
@@ -319,23 +367,33 @@ function renderSession(fresh) {
   const a = d?.agent || S.agents.find((x) => x.id === S.view.id) || { title: '', project: '', kind: 'claude', state: 'idle' };
   if (fresh || !$app.querySelector('.sessionview')) {
     $app.innerHTML = `
-      <div class="view sessionview">
-        <div class="nav">
-          <button class="iconbtn" data-act="home" aria-label="Back">${I.back}</button>
-          <div class="grow"><div class="ttl clip1" data-slot="title"></div><div class="sub clip1" data-slot="sub"></div></div>
-          <button class="iconbtn" data-act="term" aria-label="Terminal">${I.term}</button>
+      <div class="view sessionview hue">
+        <div class="top">
+          <div class="nav">
+            <button class="iconbtn" data-act="home" aria-label="Back">${I.back}</button>
+            <span data-slot="av"></span>
+            <div class="grow who"><div class="ttl clip1" data-slot="title"></div><div class="sub clip1" data-slot="sub"></div></div>
+            <button class="iconbtn" data-act="term" aria-label="Terminal">${I.term}</button>
+          </div>
+          <div class="status" data-slot="status"></div>
         </div>
-        <div class="status" data-slot="status"></div>
-        <div class="scroll"><div data-slot="panels" style="padding:0 16px"></div><div class="body" data-slot="body"></div></div>
+        <div class="sheet"><div class="scroll"><div class="panels" data-slot="panels"></div><div class="body" data-slot="body"></div></div></div>
         <div class="dock" data-slot="dock"></div>
       </div>`;
     S.dockKey = '';
   }
   const q = (s) => $app.querySelector(`[data-slot="${s}"]`);
+  $app.querySelector('.sessionview').style.setProperty('--h', hueOf(a.project));
+  tint();
+  q('av').innerHTML = a.project ? avatar(a.project, '', 'sm') : '';
   q('title').textContent = a.title || 'Starting…';
   q('sub').textContent = a.project ? `${a.project} · ${kindName(a.kind)}` : '';
-  q('status').className = 'status ' + a.state;
-  q('status').innerHTML = `<span class="mark ${a.state}"></span><b>${stateName[a.state] || ''}</b><span>${a.updated ? ago(a.updated).replace('now', 'just now') : ''}</span><span class="grow"></span>${!d || a.state === 'working' || !d.mode || a.kind !== 'claude' ? '' : `<span>${esc(modeName[d.mode] || d.mode)}</span>`}`;
+  const steps = d ? (d.items || []).filter((it) => it.kind === 'tool').length : 0;
+  const right = !d ? '' : a.state === 'need' && d.prompt?.kind ? d.prompt.kind
+    : a.state === 'working' ? (steps ? `${steps} step${steps > 1 ? 's' : ''}` : '')
+    : a.kind === 'claude' && d.mode ? (modeName[d.mode] || d.mode).toLowerCase() : '';
+  const when = a.updated ? since(a.updated) : '';
+  q('status').innerHTML = `<span class="st ${a.state}">${a.state === 'working' ? '<i class="spin"></i>' : '<i class="dot"></i>'}<b>${stateName[a.state] || ''}${when ? ' · ' + when : ''}</b></span><span class="grow"></span><span class="rt mono">${esc(right)}</span>`;
   if (!d) { if (fresh) q('body').innerHTML = '<div class="empty">Loading…</div>'; return; }
 
   const sc = $app.querySelector('.scroll');
@@ -345,7 +403,7 @@ function renderSession(fresh) {
   q('body').innerHTML = renderItems(d);
 
   // Rebuild the dock only when its shape changes, so typed text survives refreshes.
-  const key = a.state === 'need' ? 'need:' + JSON.stringify(d.prompt) : `${a.state === 'working'}:${S.showKeys}:${d.mode}:${a.title}`;
+  const key = a.state === 'need' ? 'need:' + JSON.stringify(d.prompt) : `${a.state === 'working'}:${S.showKeys}:${d.mode}:${a.title}:${S.modeMenu}:${S.modeBusy}:${d.modes}`;
   if (key !== S.dockKey) {
     const old = $app.querySelector('.dock textarea');
     const text = old ? old.value : '', role = old?.dataset.role, focused = document.activeElement === old;
@@ -381,6 +439,7 @@ function renderTerm() {
         <div class="field"><input type="text" placeholder="Type, then send" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-role="tinput"><button class="send" data-act="tsend" aria-label="Send">${I.send}</button></div>
       </div>
     </div>`;
+  tint();
 }
 async function loadScreen() {
   const id = S.view?.id;
@@ -436,20 +495,22 @@ function renderNew() {
     </div><button class="btn wide" data-act="usedir" style="margin-top:12px">Use ${esc(name(b.path))}</button>`;
   } else {
     const known = f.projects.some((p) => p.cwd === f.cwd);
-    const rows = f.projects.map((p) => `<button class="pick ${p.cwd === f.cwd ? 'on' : ''}" data-act="cwd" data-p="${esc(p.cwd)}"><span class="radio">${p.cwd === f.cwd ? I.check : ''}</span><span class="grow"><div class="pn clip1">${esc(p.name)}</div><div class="pp clip1">${esc(short(p.cwd))}</div></span><span class="time">${p.running} running</span></button>`).join('');
-    const custom = f.cwd && !known ? `<button class="pick on"><span class="radio">${I.check}</span><span class="grow"><div class="pn clip1">${esc(name(f.cwd))}</div><div class="pp clip1">${esc(short(f.cwd))}</div></span></button>` : '';
+    const pick = (pn, cwd, running) => `<button class="pick hue ${cwd === f.cwd ? 'on' : ''}" style="--h:${hueOf(pn)}" data-act="cwd" data-p="${esc(cwd)}">${avatar(pn, '', 'sm')}<span class="grow"><div class="pn clip1">${esc(pn)}</div><div class="pp clip1">${esc(short(cwd))}${running ? ` · ${running} running` : ''}</div></span><span class="radio">${cwd === f.cwd ? I.check : ''}</span></button>`;
+    const rows = f.projects.map((p) => pick(p.name, p.cwd, p.running)).join('');
+    const custom = f.cwd && !known ? pick(name(f.cwd), f.cwd, 0) : '';
     where = `<div class="label">Where</div><div class="list">${custom}${rows}<button class="pick" data-act="browse">${I.folder}<span class="grow pn" style="color:var(--ink2)">Browse folders on the Mac</span>${I.chev}</button></div>`;
   }
   $app.innerHTML = `
-    <div class="view">
+    <div class="view ${f.cwd ? 'hue' : ''}" style="--h:${hueOf(f.projects.find((p) => p.cwd === f.cwd)?.name || name(f.cwd || ''))}">
       <div class="sheet-h"><h2>New agent</h2><button class="iconbtn" data-act="home" aria-label="Close">${I.x}</button></div>
-      <div class="scroll"><div class="form">
+      <div class="sheet"><div class="scroll"><div class="form">
         <div class="seg">${f.kinds.map((k) => `<button class="${f.kind === k ? 'on' : ''}" data-act="kind" data-v="${esc(k)}">${k === 'claude' ? 'Claude Code' : k === 'codex' ? 'Codex' : esc(k)}</button>`).join('')}</div>
         <div><div class="label">What should it do</div><textarea class="area" placeholder="Describe the task. Leave empty to start a blank session.">${esc(f.prompt)}</textarea></div>
         <div>${where}</div>
-      </div></div>
+      </div></div></div>
       <div class="dock"><button class="btn pri wide" data-act="spawn" ${f.cwd && !f.busy ? '' : 'disabled'}>${f.busy ? 'Starting…' : f.cwd ? 'Start in ' + esc(name(f.cwd)) : 'Choose a folder'}</button></div>
     </div>`;
+  tint();
 }
 async function browse(path) {
   try { S.form.browse = await api('/api/dirs?path=' + encodeURIComponent(path || '')); renderNew(); } catch (e) { toast(e.message); }
@@ -477,7 +538,7 @@ function renderSettings() {
   $app.innerHTML = `
     <div class="view">
       <div class="sheet-h"><h2>Your Mac</h2><button class="iconbtn" data-act="home" aria-label="Close">${I.x}</button></div>
-      <div class="scroll"><div class="form" style="gap:0">
+      <div class="sheet"><div class="scroll"><div class="form" style="gap:0;padding-top:6px">
         <div class="kv"><span>Mac</span><span>${esc(S.host || '')}</span></div>
         <div class="kv"><span>Connection</span><span>${S.online ? 'Online' : 'Unreachable'}</span></div>
         <div class="kv"><span>Agents</span><span>${n.need} waiting · ${n.done} finished · ${n.working} working · ${n.idle} idle</span></div>
@@ -485,8 +546,9 @@ function renderSettings() {
         <p class="hint" style="margin:14px 0">${why || 'roi notifies you when an agent is waiting on you, and 30 seconds after one finishes. Working and idle agents never notify.'}</p>
         ${why ? '' : `<button class="btn pri wide" data-act="push-on">${perm === 'granted' ? 'Send a test notification' : 'Turn on notifications'}</button>`}
         <p class="hint" style="margin:22px 0 0">The Mac must stay awake for agents to keep running and for roi to be reachable.</p>
-      </div></div>
+      </div></div></div>
     </div>`;
+  tint();
 }
 function b64key(s) {
   const pad = '='.repeat((4 - (s.length % 4)) % 4);
@@ -524,6 +586,15 @@ $app.addEventListener('click', (ev) => {
     case 'back-session': go('/a/' + id); break;
     case 'keys': S.showKeys = !S.showKeys; renderSession(false); break;
     case 'toggle': { const k = el.dataset.k; if (window.getSelection().toString()) break; S.open.has(k) ? S.open.delete(k) : S.open.add(k); renderSession(false); break; }
+    case 'mode-menu': S.modeMenu = !S.modeMenu; renderSession(false); break;
+    case 'mode-close': S.modeMenu = false; renderSession(false); break;
+    case 'mode-set': {
+      S.modeMenu = false;
+      if (el.dataset.v === S.detail?.mode) { renderSession(false); break; }
+      S.modeBusy = true; renderSession(false);
+      api(base + '/mode', { mode: el.dataset.v }).catch((e) => toast(e.message)).then(() => loadDetail()).then(() => { S.modeBusy = false; if (S.view?.name === 'session') renderSession(false); });
+      break;
+    }
     case 'key': act(() => api(base + '/key', { keys: el.dataset.keys.split(' ') })); break;
     case 'send': { const t = ta(); const text = t.value.trim(); if (!text) break; t.value = ''; autosize(t); act(() => api(base + '/send', { text })); break; }
     case 'answer': el.disabled = true; act(() => api(base + '/answer', { option: +el.dataset.n })); break;
