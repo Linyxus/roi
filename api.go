@@ -73,6 +73,9 @@ type Server struct {
 	modes  sync.Map // agent id -> permission mode last read off its screen
 	cycles sync.Map // agent id -> the modes it offers, once a switch has gone all the way round
 	modeMu sync.Mutex
+
+	picked  sync.Map // agent id -> modelState: its model list, and a switch made here
+	efforts sync.Map // kind|model label -> []PickRow, the effort levels that model offers
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -175,6 +178,9 @@ func (s *Server) Handler() http.Handler {
 				out["modes"] = c
 			}
 		}
+		if m := s.currentModel(a); m != nil {
+			out["model"] = m
+		}
 		if a.State == "done" && !a.Unread {
 			a.State = "idle"
 		}
@@ -182,7 +188,7 @@ func (s *Server) Handler() http.Handler {
 		// One stamp covers everything the session view shows.
 		pb, _ := json.Marshal(out["prompt"])
 		ab, _ := json.Marshal(a)
-		stamp := fmt.Sprintf("%s|%d|%s|%s|%v", a.tr.pathOrEmpty(), rev, ab, pb, out["mode"])
+		stamp := fmt.Sprintf("%s|%d|%s|%s|%v|%v", a.tr.pathOrEmpty(), rev, ab, pb, out["mode"], out["model"])
 		out["stamp"] = fnv(stamp)
 		if r.URL.Query().Get("stamp") == out["stamp"] {
 			writeJSON(w, map[string]any{"unchanged": true})
@@ -268,6 +274,8 @@ func (s *Server) Handler() http.Handler {
 		s.modes.Store(a.ID, cur)
 		writeJSON(w, map[string]string{"mode": cur})
 	}))
+
+	s.modelRoutes(mux, agent)
 
 	mux.HandleFunc("POST /api/agents/{id}/key", agent(func(w http.ResponseWriter, r *http.Request, a Agent) {
 		var b struct {

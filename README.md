@@ -72,6 +72,9 @@ directory, which gives a second, separate roi for testing.
   buttons; tapping one presses that number. Typing instead presses Esc and
   sends your text.
 - **Terminal**: the raw pane, with a key bar, for anything else.
+- **Model and mode**: change an idle agent's model and reasoning effort, or
+  its permission mode. roi drives the agent's own `/model` list and applies
+  the choice to that session only, so your default model is never changed.
 - **New agent**: start Claude Code or Codex in a folder, with a first prompt.
 - **Notifications**: Web Push when an agent needs you, and 30 seconds after
   one finishes. On iPhone this needs roi added to the Home Screen.

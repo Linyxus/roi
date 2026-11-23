@@ -66,6 +66,8 @@ type Transcript struct {
 	byID      map[string]int
 	plan      []Todo
 	mode      string
+	model     string // model id of the latest turn
+	effort    string // its reasoning effort, where the file records one
 	truncated bool
 	rev       int
 }
@@ -157,6 +159,13 @@ func (t *Transcript) Snapshot(max int) (items []Item, plan []Todo, mode string, 
 	return items, append([]Todo(nil), t.plan...), t.mode, truncated || t.truncated, t.rev
 }
 
+// Model returns the model id and reasoning effort of the latest turn.
+func (t *Transcript) Model() (id, effort string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.model, t.effort
+}
+
 // LastAssistant returns the text of the most recent assistant message.
 func (t *Transcript) LastAssistant() string {
 	t.mu.Lock()
@@ -236,9 +245,14 @@ func (t *Transcript) claudeLine(line []byte) {
 	}
 	var m struct {
 		Content json.RawMessage `json:"content"`
+		Model   string          `json:"model"`
 	}
 	if json.Unmarshal(l.Message, &m) != nil {
 		return
+	}
+	if l.Type == "assistant" && m.Model != "" && !strings.HasPrefix(m.Model, "<") && m.Model != t.model {
+		t.model = m.Model
+		t.rev++
 	}
 	if l.Type == "user" && l.PermissionMode != "" {
 		t.mode = l.PermissionMode
@@ -319,13 +333,22 @@ var (
 
 // cleanUserText turns a raw user turn into what the person actually typed.
 // It returns "" for harness-generated turns.
+var modelSetRe = regexp.MustCompile(`<local-command-stdout>(Set model to [^<]+)</local-command-stdout>`)
+
 func cleanUserText(s string) (text, kind string) {
 	s = strings.TrimSpace(reminderRe.ReplaceAllString(s, ""))
 	if s == "" {
 		return "", ""
 	}
+	// A model switch shows as one line saying what was set, not as a message.
+	if m := modelSetRe.FindStringSubmatch(s); m != nil {
+		return strings.ReplaceAll(m[1], "`", ""), "note"
+	}
 	if m := cmdNameRe.FindStringSubmatch(s); m != nil {
 		out := strings.TrimSpace(m[1])
+		if out == "/model" {
+			return "", ""
+		}
 		if a := cmdArgsRe.FindStringSubmatch(s); a != nil && strings.TrimSpace(a[1]) != "" {
 			out += " " + strings.TrimSpace(a[1])
 		}
@@ -507,6 +530,8 @@ func (t *Transcript) codexLine(line []byte) {
 			Input     string          `json:"input"`
 			Arguments string          `json:"arguments"`
 			Output    json.RawMessage `json:"output"`
+			Model     string          `json:"model"`
+			Effort    string          `json:"effort"`
 		} `json:"payload"`
 	}
 	if json.Unmarshal(line, &l) != nil {
@@ -516,6 +541,11 @@ func (t *Transcript) codexLine(line []byte) {
 	switch {
 	case l.Type == "event_msg" && p.Type == "turn_aborted":
 		t.add(Item{Kind: "note", Text: "Interrupted", TS: l.Timestamp})
+	case l.Type == "turn_context":
+		if p.Model != "" && (p.Model != t.model || p.Effort != t.effort) {
+			t.model, t.effort = p.Model, p.Effort
+			t.rev++
+		}
 	case l.Type != "response_item":
 		return
 	case p.Type == "message" && p.Role == "user":

@@ -8,7 +8,7 @@ const S = {
   detail: null,        // last /api/agents/:id payload
   stamp: '',
   open: new Set(),     // expanded step groups, steps and diffs
-  inboxTop: 0, inboxChips: 0, dockKey: '', showKeys: false, modeMenu: false, modeBusy: false, missing: 0,
+  inboxTop: 0, inboxChips: 0, dockKey: '', showKeys: false, modeMenu: false, modeBusy: false, sheet: null, missing: 0,
   term: { fit: true, ctrl: false, alt: false, cols: 80 },
   form: null, settings: null,
 };
@@ -30,6 +30,7 @@ const I = {
   up: sv('<path d="M12 19V5M6 11l6-6 6 6"/>', 18),
   keys: sv('<rect x="3" y="6.5" width="18" height="11" rx="2.5"/><path d="M7 10.5h.01M11 10.5h.01M15 10.5h.01M8 14h8"/>'),
   pick: sv('<path d="M8 9.5l4-4 4 4M8 14.5l4 4 4-4"/>', 16),
+  chip: sv('<rect x="6.5" y="6.5" width="11" height="11" rx="2.5"/><path d="M10 3.5v3M14 3.5v3M10 17.5v3M14 17.5v3M3.5 10h3M3.5 14h3M17.5 10h3M17.5 14h3"/>', 18),
   badge: sv('<path d="M5 12.5l4.5 4.5L19 7.5"/>', 10, 3.4),
   shield: sv('<path d="M12 3l7 3v5.5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z"/>', 16, 2),
   ask: sv('<path d="M9 9.2a3 3 0 115 2.2c-.9.8-2 1.3-2 2.8M12 17.6h.01"/>', 16, 2),
@@ -79,8 +80,6 @@ function since(iso) {
 }
 const kindName =(k) => (k === 'codex' ? 'Codex' : 'Claude');
 const stateName = { need: 'Waiting on you', done: 'Finished', working: 'Working', idle: 'Idle' };
-// The idle key row has six keys, so its mode button uses the short names.
-const modeShort = { default: 'Ask first', acceptEdits: 'Edits', plan: 'Plan', bypassPermissions: 'Bypass', auto: 'Auto' };
 const modeOrder = ['default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'];
 const modeName = { default: 'Ask first', acceptEdits: 'Auto-accept edits', plan: 'Plan mode', bypassPermissions: 'Bypass permissions', auto: 'Auto mode' };
 
@@ -165,7 +164,7 @@ function route() {
   clearInterval(pollTimer); pollTimer = null;
   if (v.name === 'inbox') renderInbox();
   if (v.name === 'session') {
-    if (changed) { S.detail = null; S.stamp = ''; S.dockKey = ''; S.missing = 0; S.showKeys = false; S.modeMenu = S.modeBusy = false; }
+    if (changed) { S.detail = null; S.stamp = ''; S.dockKey = ''; S.missing = 0; S.showKeys = false; S.modeMenu = S.modeBusy = false; S.sheet = null; }
     renderSession(true); loadDetail();
     pollTimer = setInterval(loadDetail, 1500);
   }
@@ -341,7 +340,7 @@ function renderPanels(d) {
 function dockHTML(d) {
   const a = d.agent;
   const modes = d.modes?.length ? modeOrder.filter((m) => d.modes.includes(m)) : modeOrder;
-  const mode = a.kind === 'claude' && d.mode ? `<button class="key mode" data-act="mode-menu" aria-haspopup="menu" aria-expanded="${S.modeMenu}" ${S.modeBusy ? 'disabled' : ''}><span class="clip1">${S.modeBusy ? 'Switching…' : esc((a.state === 'working' ? modeName : modeShort)[d.mode] || d.mode)}</span>${S.modeBusy ? '<i class="spin"></i>' : I.pick}</button>` : '';
+  const mode = a.kind === 'claude' && d.mode ? `<button class="key mode" data-act="mode-menu" aria-haspopup="menu" aria-expanded="${S.modeMenu}" ${S.modeBusy ? 'disabled' : ''}><span class="clip1">${S.modeBusy ? 'Switching…' : esc(modeName[d.mode] || d.mode)}</span>${S.modeBusy ? '<i class="spin"></i>' : I.pick}</button>` : '';
   const menu = mode && S.modeMenu ? `<button class="shade" data-act="mode-close" aria-label="Close"></button><div class="menu" role="menu"><div class="label">Permission mode</div>${modes.map((m) => `<button class="mi ${m === d.mode ? 'on' : ''}" role="menuitemradio" aria-checked="${m === d.mode}" data-act="mode-set" data-v="${m}"><span class="grow">${modeName[m]}</span>${m === d.mode ? I.check : ''}</button>`).join('')}</div>` : '';
   if (a.state === 'need' && d.prompt) {
     const p = d.prompt;
@@ -358,8 +357,11 @@ function dockHTML(d) {
   const working = a.state === 'working';
   const keys = working
     ? `<div class="keys"><button class="key stop" data-act="key" data-keys="escape">${I.stop}Stop</button><button class="key" data-act="key" data-keys="ctrl+c">⌃C</button>${mode}</div>`
-    : S.showKeys ? `<div class="keys"><button class="key" data-act="key" data-keys="escape">esc</button><button class="key" data-act="key" data-keys="ctrl+c">⌃C</button><button class="key" data-act="key" data-keys="up">↑</button><button class="key" data-act="key" data-keys="down">↓</button><button class="key" data-act="key" data-keys="enter">⏎</button>${mode}</div>` : '';
-  return `${menu}${keys}<div class="field"><textarea rows="1" placeholder="${working ? 'Steer it. Read at the next step' : 'Reply'}" data-role="send"></textarea>${working ? '' : `<button class="iconbtn" data-act="keys" aria-label="Keys" style="color:var(--ink2);width:40px">${I.keys}</button>`}<button class="send" data-act="send" aria-label="Send">${I.send}</button></div>`;
+    : S.showKeys ? `<div class="keys">${[['esc', 'escape'], ['⌃C', 'ctrl+c'], ['↑', 'up'], ['↓', 'down'], ['⏎', 'enter']].map(([l, k]) => `<button class="key grow" data-act="key" data-keys="${k}">${l}</button>`).join('')}</div>` : '';
+  // While idle, the model and the permission mode sit above the reply field.
+  const model = `<button class="key model" data-act="model-open" aria-haspopup="dialog" aria-label="Model${d.model ? ': ' + esc(d.model.name) : ''}. Tap to change.">${I.chip}<span class="clip1 grow">${d.model ? `<b>${esc(d.model.name)}</b>${d.model.effort ? ' · ' + esc(d.model.effort) : ''}` : 'Model'}</span>${I.pick}</button>`;
+  const ctl = working ? '' : `<div class="keys ctl">${model}${mode}</div>`;
+  return `${menu}${ctl}${keys}<div class="field"><textarea rows="1" placeholder="${working ? 'Steer it. Read at the next step' : 'Reply'}" data-role="send"></textarea>${working ? '' : `<button class="iconbtn" data-act="keys" aria-label="Keys" style="color:var(--ink2);width:40px">${I.keys}</button>`}<button class="send" data-act="send" aria-label="Send">${I.send}</button></div>`;
 }
 
 function renderSession(fresh) {
@@ -379,8 +381,10 @@ function renderSession(fresh) {
         </div>
         <div class="sheet"><div class="scroll"><div class="panels" data-slot="panels"></div><div class="body" data-slot="body"></div></div></div>
         <div class="dock" data-slot="dock"></div>
+        <div data-slot="overlay"></div>
       </div>`;
     S.dockKey = '';
+    renderSheet();
   }
   const q = (s) => $app.querySelector(`[data-slot="${s}"]`);
   $app.querySelector('.sessionview').style.setProperty('--h', hueOf(a.project));
@@ -403,7 +407,7 @@ function renderSession(fresh) {
   q('body').innerHTML = renderItems(d);
 
   // Rebuild the dock only when its shape changes, so typed text survives refreshes.
-  const key = a.state === 'need' ? 'need:' + JSON.stringify(d.prompt) : `${a.state === 'working'}:${S.showKeys}:${d.mode}:${a.title}:${S.modeMenu}:${S.modeBusy}:${d.modes}`;
+  const key = a.state === 'need' ? 'need:' + JSON.stringify(d.prompt) : `${a.state === 'working'}:${S.showKeys}:${d.mode}:${a.title}:${S.modeMenu}:${S.modeBusy}:${d.modes}:${JSON.stringify(d.model)}`;
   if (key !== S.dockKey) {
     const old = $app.querySelector('.dock textarea');
     const text = old ? old.value : '', role = old?.dataset.role, focused = document.activeElement === old;
@@ -413,6 +417,67 @@ function renderSession(fresh) {
     S.dockKey = key;
   }
   sc.scrollTop = atBottom ? sc.scrollHeight : top;
+}
+
+// ---------- model sheet ----------
+// The lists come from the agent's own /model picker, read off its screen.
+function renderSheet() {
+  const el = $app.querySelector('[data-slot="overlay"]');
+  if (!el) return;
+  const m = S.sheet;
+  if (!m) { el.innerHTML = ''; return; }
+  const tool = (S.detail?.agent.kind || 'claude') === 'codex' ? 'Codex' : 'Claude Code';
+  const second = m.step === 'efforts';
+  const tag = (r) => (r.current ? '<i class="tag on">Current</i>' : r.default ? '<i class="tag">Default</i>' : '');
+  let body;
+  if (m.error) body = `<div class="bs-msg"><b>That did not work</b><span>${esc(m.error)}</span><button class="btn" data-act="model-retry">Try again</button></div>`;
+  else if (m.busy) body = `<div class="bs-msg"><i class="spin"></i><span>Switching to <b>${esc(m.pick.label)}</b>${m.effort ? ' · ' + esc(m.effort.toLowerCase()) : ''}…</span></div>`;
+  else if (m.loading) body = `<div class="bs-msg"><i class="spin"></i><span>Reading ${second ? 'the effort levels' : 'the models'} from ${tool}…</span></div>`;
+  else if (second) body = m.efforts.map((r) => `<button class="mrow ${r.current && m.pick.current ? 'on' : ''}" data-act="model-effort" data-v="${esc(r.label)}"><span class="grow"><span class="mr-t">${esc(r.label)}${r.current && m.pick.current ? tag(r) : r.default ? '<i class="tag">Default</i>' : ''}</span>${r.desc ? `<span class="mr-d">${esc(r.desc)}</span>` : ''}</span></button>`).join('');
+  else body = m.models.map((r) => `<button class="mrow ${r.current ? 'on' : ''}" data-act="model-pick" data-n="${r.n}"><span class="grow"><span class="mr-t">${esc(r.label)}${tag(r)}</span>${r.desc ? `<span class="mr-d">${esc(r.desc)}</span>` : ''}</span>${I.chev}</button>`).join('');
+  const keep = el.querySelector('.bs-b')?.scrollTop || 0, same = el.dataset.step === m.step;
+  el.dataset.step = m.step;
+  el.innerHTML = `<button class="scrim ${same ? 'still' : ''}" data-act="model-close" aria-label="Close"></button>
+    <div class="bsheet ${same ? 'still' : ''}" role="dialog" aria-label="Model">
+      <div class="grab"></div>
+      <div class="bs-h ${second ? 'back' : ''}">
+        ${second ? `<button class="iconbtn" data-act="model-back" aria-label="Back to models" ${m.busy ? 'disabled' : ''}>${I.back}</button>` : ''}
+        <div class="grow"><div class="bs-t clip1">${second ? esc(m.pick.label) : 'Model'}</div><div class="bs-s">${second ? 'Reasoning effort' : tool}</div></div>
+        <button class="iconbtn" data-act="model-close" aria-label="Close">${I.x}</button>
+      </div>
+      <div class="bs-b">${body}</div>
+      <div class="bs-f">This session only. Your default stays the same.</div>
+    </div>`;
+  if (same) el.querySelector('.bs-b').scrollTop = keep;
+}
+// Each step checks that the sheet it started in is still the one showing.
+async function openModels(fresh) {
+  const id = S.view.id, m = (S.sheet = { step: 'models', loading: true });
+  renderSheet();
+  try { const j = await api(`/api/agents/${encodeURIComponent(id)}/models${fresh ? '?fresh=1' : ''}`); if (S.sheet !== m) return; S.sheet = { step: 'models', models: j.models }; loadDetail(); }
+  catch (e) { if (S.sheet !== m) return; S.sheet = { step: 'models', error: e.message }; }
+  renderSheet();
+}
+async function pickModel(pick, models) {
+  const id = S.view.id, m = (S.sheet = { step: 'efforts', pick, models, loading: true });
+  renderSheet();
+  try {
+    const j = await api(`/api/agents/${encodeURIComponent(id)}/efforts?n=${pick.n}&label=${encodeURIComponent(pick.label)}`);
+    if (S.sheet !== m) return;
+    if (!j.efforts.length) return applyModel('');
+    S.sheet = { step: 'efforts', pick, models, efforts: j.efforts };
+  } catch (e) { if (S.sheet !== m) return; S.sheet = { step: 'efforts', pick, models, error: e.message }; }
+  renderSheet();
+}
+async function applyModel(effort) {
+  const id = S.view.id, m = (S.sheet = { ...S.sheet, loading: false, busy: true, effort });
+  renderSheet();
+  try {
+    const j = await api(`/api/agents/${encodeURIComponent(id)}/model`, { n: m.pick.n, label: m.pick.label, effort });
+    if (S.sheet === m) { S.sheet = null; renderSheet(); }
+    toast(`Now on ${j.name}${j.effort ? ' · ' + j.effort : ''}, for this session only.`);
+    loadDetail();
+  } catch (e) { if (S.sheet !== m) return; S.sheet = { ...m, busy: false, error: e.message }; renderSheet(); }
 }
 
 function autosize(ta) { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'; }
@@ -586,6 +651,12 @@ $app.addEventListener('click', (ev) => {
     case 'back-session': go('/a/' + id); break;
     case 'keys': S.showKeys = !S.showKeys; renderSession(false); break;
     case 'toggle': { const k = el.dataset.k; if (window.getSelection().toString()) break; S.open.has(k) ? S.open.delete(k) : S.open.add(k); renderSession(false); break; }
+    case 'model-open': S.modeMenu = false; openModels(false); break;
+    case 'model-close': S.sheet = null; renderSheet(); break;
+    case 'model-back': S.sheet = { step: 'models', models: S.sheet.models }; renderSheet(); if (!S.sheet.models) openModels(false); break;
+    case 'model-retry': S.sheet.pick ? pickModel(S.sheet.pick, S.sheet.models) : openModels(true); break;
+    case 'model-pick': { const r = S.sheet.models.find((x) => x.n === +el.dataset.n); if (r) pickModel(r, S.sheet.models); break; }
+    case 'model-effort': applyModel(el.dataset.v); break;
     case 'mode-menu': S.modeMenu = !S.modeMenu; renderSession(false); break;
     case 'mode-close': S.modeMenu = false; renderSession(false); break;
     case 'mode-set': {
