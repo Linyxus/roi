@@ -422,6 +422,64 @@ func (p pickDriver) codexLevels() (*pickerView, string, error) {
 	return v, scr, nil
 }
 
+// switchAsk is Claude Code's "Switch model?" (or "Change effort level?")
+// question, shown after a pick when the conversation is cached for the
+// current model: switching re-reads the whole history once.
+type switchAsk struct {
+	yes    int  // the number of the "Yes, switch to …" row, 0 when unnumbered
+	cursor bool // the cursor is on that row
+}
+
+var (
+	askTitleRe = regexp.MustCompile(`^\s*(Switch model|Change effort level)\?\s*$`)
+	askYesRe   = regexp.MustCompile(`^\s*(?:([❯›>])\s*)?(?:(\d+)\.\s+)?Yes, switch to \S`)
+)
+
+func parseSwitchAsk(screen string) *switchAsk {
+	lines := strings.Split(screen, "\n")
+	at := -1
+	for i, l := range lines {
+		if askTitleRe.MatchString(l) {
+			at = i
+		}
+	}
+	if at < 0 {
+		return nil
+	}
+	for _, l := range lines[at+1:] {
+		if m := askYesRe.FindStringSubmatch(l); m != nil {
+			n, _ := strconv.Atoi(m[2])
+			return &switchAsk{yes: n, cursor: m[1] != ""}
+		}
+	}
+	return nil
+}
+
+// confirmSwitch answers yes to the switch question.
+func (p pickDriver) confirmSwitch(a *switchAsk) error {
+	switch {
+	case a.cursor:
+		return p.keys("enter")
+	case a.yes > 0:
+		return p.keys(strconv.Itoa(a.yes))
+	}
+	// Unnumbered, with the cursor on "No": Claude Code does this when the
+	// switch would spend usage credits. Leave that choice to the user.
+	return errors.New("the agent wants you to confirm this switch in its terminal")
+}
+
+// sinceCommand is the part of a screen after the last /model typed, so a
+// result line left by an earlier switch is not taken for this one's.
+func sinceCommand(screen string) string {
+	lines := strings.Split(screen, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if pickInputRe.MatchString(lines[i]) {
+			return strings.Join(lines[i+1:], "\n")
+		}
+	}
+	return screen
+}
+
 var errSavedDefault = errors.New("Codex applied this model at once, as its default for new sessions too. To undo that, pick your usual model in Codex's own /model list")
 
 // ---- what roi knows about an agent's model ----
@@ -618,9 +676,23 @@ func (s *Server) modelRoutes(mux *http.ServeMux, agent func(func(http.ResponseWr
 			fail(w, 502, err)
 			return
 		}
-		_, scr, _ := p.wait(5*time.Second, func(v *pickerView, scr string) bool { return v == nil && setRe.MatchString(scr) })
-		m := setRe.FindAllStringSubmatch(scr, -1)
-		if parsePicker(scr) != nil || m == nil {
+		settled := func(v *pickerView, scr string) bool {
+			return v == nil && (setRe.MatchString(sinceCommand(scr)) || parseSwitchAsk(scr) != nil)
+		}
+		_, scr, _ := p.wait(5*time.Second, settled)
+		// Claude Code asks once more when the conversation is cached for the
+		// current model. The phone asked for the switch, so roi says yes.
+		if ask := parseSwitchAsk(scr); ask != nil {
+			if err := p.confirmSwitch(ask); err != nil {
+				fail(w, 502, err)
+				return
+			}
+			_, scr, _ = p.wait(5*time.Second, func(v *pickerView, scr string) bool {
+				return v == nil && parseSwitchAsk(scr) == nil && setRe.MatchString(sinceCommand(scr))
+			})
+		}
+		m := setRe.FindAllStringSubmatch(sinceCommand(scr), -1)
+		if parsePicker(scr) != nil || parseSwitchAsk(scr) != nil || m == nil {
 			fail(w, 502, errors.New("the agent did not confirm the switch; check its terminal"))
 			return
 		}

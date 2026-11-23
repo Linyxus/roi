@@ -52,6 +52,7 @@ type Hub struct {
 	seen   map[string]string // agent id -> updated stamp the user has seen
 	last   string            // last broadcast JSON
 	subs   map[chan struct{}]struct{}
+	watch  map[string]map[chan struct{}]struct{} // agent id -> streams with that session open
 	ready  bool
 
 	dirty chan dirtyReq
@@ -62,7 +63,7 @@ type dirtyReq struct{ session, block string }
 
 func newHub(rex *Rex, home, dir string) *Hub {
 	h := &Hub{rex: rex, home: home, dir: dir, agents: map[string]*Agent{}, seen: map[string]string{},
-		subs: map[chan struct{}]struct{}{}, dirty: make(chan dirtyReq, 256)}
+		subs: map[chan struct{}]struct{}{}, watch: map[string]map[chan struct{}]struct{}{}, dirty: make(chan dirtyReq, 256)}
 	if b, err := os.ReadFile(filepath.Join(dir, "seen.json")); err == nil {
 		json.Unmarshal(b, &h.seen)
 	}
@@ -118,6 +119,7 @@ func (h *Hub) Run(ctx context.Context) {
 			}
 			if full {
 				h.refreshAll()
+				h.touch("")
 				continue
 			}
 			known := true
@@ -130,10 +132,12 @@ func (h *Hub) Run(ctx context.Context) {
 			h.mu.Unlock()
 			if !known { // a pane we do not track yet may have become an agent
 				h.refreshAll()
+				h.touch("")
 				continue
 			}
 			for b, s := range blocks {
 				h.refreshBlock(s, "", b)
+				h.touch(agentID(b))
 			}
 			h.broadcast()
 		}
@@ -504,6 +508,43 @@ func (h *Hub) Subscribe() (chan struct{}, func()) {
 		h.mu.Lock()
 		delete(h.subs, ch)
 		h.mu.Unlock()
+	}
+}
+
+// Watch reports each time an agent's pane has been read again, which is
+// when its session may have changed.
+func (h *Hub) Watch(id string) (chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	h.mu.Lock()
+	if h.watch[id] == nil {
+		h.watch[id] = map[chan struct{}]struct{}{}
+	}
+	h.watch[id][ch] = struct{}{}
+	h.mu.Unlock()
+	return ch, func() {
+		h.mu.Lock()
+		delete(h.watch[id], ch)
+		if len(h.watch[id]) == 0 {
+			delete(h.watch, id)
+		}
+		h.mu.Unlock()
+	}
+}
+
+// touch wakes the streams watching agent id, or all of them when id is "".
+func (h *Hub) touch(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k, chs := range h.watch {
+		if id != "" && k != id {
+			continue
+		}
+		for ch := range chs {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
 	}
 }
 

@@ -55,6 +55,13 @@ type Item struct {
 	Pending   bool       `json:"pending,omitempty"`
 	Diff      *Diff      `json:"diff,omitempty"`
 	Questions []Question `json:"questions,omitempty"`
+	// Seq is the item's position in the transcript, which is how the phone
+	// names it. Lazy marks an item sent without its input, output and diff
+	// lines; the phone asks for those when the step is opened.
+	Seq  int  `json:"seq"`
+	Lazy bool `json:"lazy,omitempty"`
+
+	rev int // the transcript revision that last changed this item
 }
 
 type Transcript struct {
@@ -70,6 +77,7 @@ type Transcript struct {
 	effort    string // its reasoning effort, where the file records one
 	truncated bool
 	rev       int
+	epoch     int // counts the times the file was replaced and read afresh
 }
 
 const (
@@ -98,6 +106,7 @@ func (t *Transcript) Update() {
 	}
 	if st.Size() < t.offset { // file was replaced
 		t.offset, t.items, t.byID, t.plan, t.truncated = 0, nil, map[string]int{}, nil, false
+		t.epoch++
 	}
 	if st.Size() == t.offset {
 		return
@@ -139,11 +148,100 @@ func (t *Transcript) Update() {
 }
 
 func (t *Transcript) add(it Item) {
+	t.rev++
+	it.rev = t.rev
 	t.items = append(t.items, it)
 	if it.ID != "" {
 		t.byID[it.ID] = len(t.items) - 1
 	}
+}
+
+// touch records that item i changed in place.
+func (t *Transcript) touch(i int) {
 	t.rev++
+	t.items[i].rev = t.rev
+}
+
+// View is one reading of a transcript for the phone: either its last few
+// items, or only the items that changed since a revision the phone has.
+type View struct {
+	ID        string // names this file and this reading of it
+	Items     []Item
+	From      int // position of the oldest item the phone holds after this
+	Total     int
+	Rev       int
+	Delta     bool
+	Plan      []Todo
+	Mode      string
+	Truncated bool
+}
+
+func (t *Transcript) id() string { return fnv(t.Path) + "." + itoa(t.epoch) }
+
+// slim copies item i for sending, without the parts that stay hidden until
+// a step is opened. Those are most of a session's bytes.
+func (t *Transcript) slim(i int) Item {
+	it := t.items[i]
+	it.Seq = i
+	if it.Kind == "tool" {
+		it.Lazy = it.Input != "" || it.Output != "" || (it.Diff != nil && len(it.Diff.Lines) > 0)
+		it.Input, it.Output = "", ""
+		if it.Diff != nil {
+			d := *it.Diff
+			d.Lines = nil
+			it.Diff = &d
+		}
+	}
+	return it
+}
+
+// View returns the items changed after revision since, from position from
+// on, when have names this same reading; otherwise the last n items.
+func (t *Transcript) View(have string, since, from, n int) View {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	v := View{ID: t.id(), Total: len(t.items), Rev: t.rev, Plan: append([]Todo(nil), t.plan...), Mode: t.mode, Truncated: t.truncated, Items: []Item{}}
+	if have == v.ID && since >= 0 && since <= t.rev && from >= 0 && from <= len(t.items) {
+		v.Delta, v.From = true, from
+		for i := from; i < len(t.items); i++ {
+			if t.items[i].rev > since {
+				v.Items = append(v.Items, t.slim(i))
+			}
+		}
+		return v
+	}
+	v.From = max(0, len(t.items)-n)
+	for i := v.From; i < len(t.items); i++ {
+		v.Items = append(v.Items, t.slim(i))
+	}
+	return v
+}
+
+// Before returns up to n items that come before position before.
+func (t *Transcript) Before(have string, before, n int) (items []Item, from int, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if have != t.id() || before < 0 || before > len(t.items) {
+		return nil, 0, false
+	}
+	from = max(0, before-n)
+	items = []Item{}
+	for i := from; i < before; i++ {
+		items = append(items, t.slim(i))
+	}
+	return items, from, true
+}
+
+// Full returns item seq whole, with its input, output and diff.
+func (t *Transcript) Full(have string, seq int) (Item, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if have != t.id() || seq < 0 || seq >= len(t.items) {
+		return Item{}, false
+	}
+	it := t.items[seq]
+	it.Seq = seq
+	return it, true
 }
 
 // Snapshot returns the last max items and the derived state.
@@ -286,7 +384,7 @@ func (t *Transcript) claudeLine(line []byte) {
 			if d := patchDiff(l.ToolUseResult); d != nil {
 				it.Diff = d
 			}
-			t.rev++
+			t.touch(i)
 		case l.Type == "assistant" && b.Type == "text":
 			if s := strings.TrimSpace(b.Text); s != "" {
 				t.add(Item{Kind: "assistant", Text: s, TS: l.Timestamp})
@@ -611,7 +709,7 @@ func (t *Transcript) codexLine(line []byte) {
 		}
 		t.items[i].Pending = false
 		t.items[i].Output = clip(out, maxOutput)
-		t.rev++
+		t.touch(i)
 	}
 }
 

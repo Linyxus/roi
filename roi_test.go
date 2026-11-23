@@ -1,6 +1,10 @@
 package main
 
 import (
+	"compress/gzip"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -367,6 +371,31 @@ func TestParsePicker(t *testing.T) {
 	}
 }
 
+func TestSwitchAsk(t *testing.T) {
+	ask := `❯ /model
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  Switch model?
+  This conversation is cached for the current model. Switching to Opus 5.5 means
+  the full history gets re-read. Your next response will be slower and use more tokens.
+
+  ❯ 1. Yes, switch to Opus 5.5
+    2. No, go back`
+	if a := parseSwitchAsk(ask); a == nil || a.yes != 1 || !a.cursor {
+		t.Fatalf("switch question: %+v", a)
+	}
+	if a := parseSwitchAsk("  Change effort level?\n  ...\n    1. Yes, switch to high\n  ❯ 2. No, go back"); a == nil || a.yes != 1 || a.cursor {
+		t.Fatalf("effort question, cursor on no: %+v", a)
+	}
+	if parseSwitchAsk(claudePicker) != nil || parseSwitchAsk("❯ hello") != nil {
+		t.Error("question found where there is none")
+	}
+	// Only what follows the last /model counts as this switch's result.
+	scr := "❯ /model\n  ⎿  Set model to Fable 5.2 for this session only\n❯ /model\n  ⎿  Kept model as Opus 5.5\n❯ "
+	if claudeSetRe.MatchString(sinceCommand(scr)) {
+		t.Error("an earlier switch's result was read as this one's")
+	}
+}
+
 func TestModelName(t *testing.T) {
 	for id, want := range map[string]string{
 		"lamppc/claude/claude-fable-5-2": "Fable 5.2", "claude-sonnet-4-5-20250929": "Sonnet 4.5",
@@ -385,5 +414,96 @@ func TestModelSwitchInTranscript(t *testing.T) {
 	text, kind := cleanUserText("<local-command-stdout>Set model to `Opus 5.5` for this session only with `xhigh` effort</local-command-stdout>")
 	if text != "Set model to Opus 5.5 for this session only with xhigh effort" || kind != "note" {
 		t.Errorf("switch line: %q %q", text, kind)
+	}
+}
+
+func TestTranscriptView(t *testing.T) {
+	tr := newTranscript("claude", "/x/session.jsonl")
+	tr.add(Item{Kind: "user", Text: "go"})
+	tr.add(Item{Kind: "tool", ID: "t1", Name: "Bash", Summary: "ls", Input: "ls -la", Pending: true})
+	for i := 0; i < 5; i++ {
+		tr.add(Item{Kind: "assistant", Text: "step"})
+	}
+
+	// With nothing in hand, the phone gets the last n items, without the
+	// parts that stay hidden until a step is opened.
+	v := tr.View("", -1, 0, 3)
+	if v.Delta || v.From != 4 || len(v.Items) != 3 || v.Items[0].Seq != 4 || v.Total != 7 {
+		t.Fatalf("first page: %+v", v)
+	}
+	all := tr.View("", -1, 0, 100)
+	if tool := all.Items[1]; tool.Input != "" || !tool.Lazy || tool.Seq != 1 {
+		t.Errorf("tool item was not slimmed: %+v", tool)
+	}
+
+	// Nothing changed: an empty delta.
+	if d := tr.View(v.ID, v.Rev, v.From, 3); !d.Delta || len(d.Items) != 0 {
+		t.Errorf("unchanged: %+v", d)
+	}
+	// A result arrives for the old tool call and a message is added. A phone
+	// holding everything gets both; one holding only the tail gets the message.
+	tr.items[1].Pending, tr.items[1].Output = false, "total 0"
+	tr.touch(1)
+	tr.add(Item{Kind: "assistant", Text: "done"})
+	if d := tr.View(v.ID, v.Rev, 0, 3); !d.Delta || len(d.Items) != 2 || d.Items[0].Seq != 1 || d.Items[0].Pending || d.Items[1].Seq != 7 {
+		t.Errorf("delta from 0: %+v", d.Items)
+	}
+	if d := tr.View(v.ID, v.Rev, 4, 3); len(d.Items) != 1 || d.Items[0].Text != "done" {
+		t.Errorf("delta from 4: %+v", d.Items)
+	}
+	// A phone holding another reading starts again.
+	if d := tr.View("other.0", v.Rev, 4, 3); d.Delta || len(d.Items) != 3 {
+		t.Errorf("stale reading: %+v", d)
+	}
+
+	older, from, ok := tr.Before(v.ID, 4, 3)
+	if !ok || from != 1 || len(older) != 3 || older[0].Seq != 1 {
+		t.Errorf("older page: %v %d %+v", ok, from, older)
+	}
+	if it, ok := tr.Full(v.ID, 1); !ok || it.Input != "ls -la" || it.Output != "total 0" {
+		t.Errorf("full item: %v %+v", ok, it)
+	}
+	if _, ok := tr.Full("other.0", 1); ok {
+		t.Error("full item served for another reading")
+	}
+}
+
+func TestCompress(t *testing.T) {
+	h := compress(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/img" {
+			w.Header().Set("Content-Type", "image/png")
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		w.Write([]byte(strings.Repeat(`{"a":1}`, 200)))
+	}))
+	get := func(path, accept string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", path, nil)
+		if accept != "" {
+			r.Header.Set("Accept-Encoding", accept)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	w := get("/api/agents", "gzip, br")
+	if w.Header().Get("Content-Encoding") != "gzip" || w.Body.Len() >= 1400 {
+		t.Fatalf("json was not compressed: %v, %d bytes", w.Header(), w.Body.Len())
+	}
+	zr, err := gzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := io.ReadAll(zr); len(b) != 1400 {
+		t.Errorf("round trip gave %d bytes", len(b))
+	}
+	if w := get("/api/agents", ""); w.Header().Get("Content-Encoding") != "" || w.Body.Len() != 1400 {
+		t.Error("compressed for a client that did not ask")
+	}
+	if w := get("/img", "gzip"); w.Header().Get("Content-Encoding") != "" {
+		t.Error("compressed an image")
+	}
+	if w := get("/api/events", "gzip"); w.Header().Get("Content-Encoding") != "" {
+		t.Error("compressed the event stream")
 	}
 }

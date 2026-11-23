@@ -1,16 +1,19 @@
 package main
 
 import (
+	"compress/gzip"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -99,8 +102,26 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	sub, _ := fs.Sub(webFS, "web")
 	files := http.FileServer(http.FS(sub))
+	// Embedded files carry no modification time, so each gets a tag from its
+	// contents; the phone then revalidates instead of downloading again.
+	tags := map[string]string{}
+	fs.WalkDir(sub, ".", func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			if b, err := fs.ReadFile(sub, p); err == nil {
+				tags["/"+p] = `"` + fnv(string(b)) + `"`
+			}
+		}
+		return nil
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
+		p := r.URL.Path
+		if p == "/" {
+			p = "/index.html"
+		}
+		if t, ok := tags[p]; ok {
+			w.Header().Set("ETag", t)
+		}
 		if strings.HasSuffix(r.URL.Path, ".webmanifest") {
 			w.Header().Set("Content-Type", "application/manifest+json")
 		}
@@ -111,6 +132,9 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, map[string]any{"agents": s.hub.List(), "host": s.host})
 	})
 
+	// One stream per phone. It says when the agent list changed, and for the
+	// session the phone has open (watch=id) it carries each change itself:
+	// only the items that are new or different since the last one sent.
 	mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
 		fl, ok := w.(http.Flusher)
 		if !ok {
@@ -121,16 +145,60 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		ch, cancel := s.hub.Subscribe()
 		defer cancel()
+		q := r.URL.Query()
+		watch := q.Get("watch")
+		var touched chan struct{}
+		if watch != "" {
+			var stop func()
+			touched, stop = s.hub.Watch(watch)
+			defer stop()
+		}
+		have := detailReq{tr: q.Get("tr"), since: atoi(q.Get("since"), -1), from: atoi(q.Get("from"), 0), n: firstPage}
+		stamp := q.Get("stamp")
+		session := func() {
+			a, ok := s.hub.Get(watch)
+			if !ok {
+				fmt.Fprint(w, "event: gone\ndata: {}\n\n")
+				return
+			}
+			out, st := s.detail(a, have)
+			if st == stamp {
+				return
+			}
+			b, err := json.Marshal(out)
+			if err != nil {
+				return
+			}
+			stamp = st
+			have.tr, _ = out["tr"].(string)
+			have.since, _ = out["rev"].(int)
+			have.from, _ = out["from"].(int)
+			fmt.Fprintf(w, "event: session\ndata: %s\n\n", b)
+		}
 		fmt.Fprint(w, "data: hello\n\n")
+		if watch != "" {
+			session()
+		}
 		fl.Flush()
 		ping := time.NewTicker(25 * time.Second)
 		defer ping.Stop()
+		// The mode and a prompt are read off the screen, which can change
+		// without the session file changing; look again every few seconds.
+		look := time.NewTicker(3 * time.Second)
+		defer look.Stop()
 		for {
 			select {
 			case <-r.Context().Done():
 				return
 			case <-ch:
 				fmt.Fprint(w, "data: agents\n\n")
+			case <-touched:
+				session()
+			case <-look.C:
+				if watch == "" {
+					continue
+				}
+				session()
 			case <-ping.C:
 				fmt.Fprint(w, ": ping\n\n")
 			}
@@ -150,51 +218,42 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	mux.HandleFunc("GET /api/agents/{id}", agent(func(w http.ResponseWriter, r *http.Request, a Agent) {
-		out := map[string]any{}
-		rev := 0
-		if a.tr != nil {
-			a.tr.Update()
-			items, plan, mode, truncated, trev := a.tr.Snapshot(400)
-			out["items"], out["plan"], out["mode"], out["truncated"] = items, plan, mode, truncated
-			rev = trev
-		} else {
-			out["items"], out["noTranscript"] = []Item{}, true
-		}
-		if a.State == "need" {
-			out["prompt"] = s.hub.BuildPrompt(a)
-		}
-		if a.Kind == "claude" {
-			// The screen has the mode as it is now; a prompt can cover the
-			// footer, so the last one read is kept.
-			if screen, err := s.rex.screenText(a.Session, a.block, 6); err == nil {
-				if m := screenMode(screen); m != "" {
-					s.modes.Store(a.ID, m)
-				}
-			}
-			if m, ok := s.modes.Load(a.ID); ok {
-				out["mode"] = m
-			}
-			if c, ok := s.cycles.Load(a.ID); ok {
-				out["modes"] = c
-			}
-		}
-		if m := s.currentModel(a); m != nil {
-			out["model"] = m
-		}
-		if a.State == "done" && !a.Unread {
-			a.State = "idle"
-		}
-		out["agent"] = a
-		// One stamp covers everything the session view shows.
-		pb, _ := json.Marshal(out["prompt"])
-		ab, _ := json.Marshal(a)
-		stamp := fmt.Sprintf("%s|%d|%s|%s|%v|%v", a.tr.pathOrEmpty(), rev, ab, pb, out["mode"], out["model"])
-		out["stamp"] = fnv(stamp)
-		if r.URL.Query().Get("stamp") == out["stamp"] {
+		q := r.URL.Query()
+		out, stamp := s.detail(a, detailReq{tr: q.Get("tr"), since: atoi(q.Get("since"), -1), from: atoi(q.Get("from"), 0), n: firstPage})
+		if q.Get("stamp") == stamp {
 			writeJSON(w, map[string]any{"unchanged": true})
 			return
 		}
 		writeJSON(w, out)
+	}))
+
+	// Older items, for scrolling back.
+	mux.HandleFunc("GET /api/agents/{id}/items", agent(func(w http.ResponseWriter, r *http.Request, a Agent) {
+		q := r.URL.Query()
+		if a.tr == nil {
+			fail(w, 409, errStale)
+			return
+		}
+		items, from, ok := a.tr.Before(q.Get("tr"), atoi(q.Get("before"), -1), min(max(atoi(q.Get("n"), firstPage), 1), 200))
+		if !ok {
+			fail(w, 409, errStale)
+			return
+		}
+		writeJSON(w, map[string]any{"items": items, "from": from})
+	}))
+
+	// One item whole: a step's input and output, a diff's lines.
+	mux.HandleFunc("GET /api/agents/{id}/items/{seq}", agent(func(w http.ResponseWriter, r *http.Request, a Agent) {
+		if a.tr == nil {
+			fail(w, 409, errStale)
+			return
+		}
+		it, ok := a.tr.Full(r.URL.Query().Get("tr"), atoi(r.PathValue("seq"), -1))
+		if !ok {
+			fail(w, 409, errStale)
+			return
+		}
+		writeJSON(w, map[string]any{"item": it})
 	}))
 
 	mux.HandleFunc("POST /api/agents/{id}/seen", agent(func(w http.ResponseWriter, r *http.Request, a Agent) {
@@ -439,7 +498,75 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, map[string]int{"delivered": n})
 	})
 
-	return guard(mux)
+	return guard(compress(mux))
+}
+
+// firstPage is how many of a session's latest items the phone gets when it
+// opens the session; older ones are fetched as it scrolls back.
+const firstPage = 60
+
+var errStale = errors.New("this conversation has moved on; reopen it")
+
+func atoi(s string, def int) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// detailReq says what the phone already holds of a session's transcript.
+type detailReq struct {
+	tr          string // the reading it has, from an earlier answer
+	since, from int    // its revision, and its oldest item
+	n           int    // how many items to send when it has nothing usable
+}
+
+// detail is everything the session view shows, and a stamp that changes
+// when any of it does.
+func (s *Server) detail(a Agent, q detailReq) (map[string]any, string) {
+	out := map[string]any{}
+	rev := 0
+	if a.tr != nil {
+		a.tr.Update()
+		v := a.tr.View(q.tr, q.since, q.from, q.n)
+		out["items"], out["plan"], out["mode"], out["truncated"] = v.Items, v.Plan, v.Mode, v.Truncated
+		out["tr"], out["rev"], out["from"], out["total"], out["delta"] = v.ID, v.Rev, v.From, v.Total, v.Delta
+		rev = v.Rev
+	} else {
+		out["items"], out["noTranscript"], out["tr"], out["rev"], out["from"], out["total"] = []Item{}, true, "", 0, 0, 0
+	}
+	if a.State == "need" {
+		out["prompt"] = s.hub.BuildPrompt(a)
+	}
+	if a.Kind == "claude" {
+		// The screen has the mode as it is now; a prompt can cover the
+		// footer, so the last one read is kept.
+		if screen, err := s.rex.screenText(a.Session, a.block, 6); err == nil {
+			if m := screenMode(screen); m != "" {
+				s.modes.Store(a.ID, m)
+			}
+		}
+		if m, ok := s.modes.Load(a.ID); ok {
+			out["mode"] = m
+		}
+		if c, ok := s.cycles.Load(a.ID); ok {
+			out["modes"] = c
+		}
+	}
+	if m := s.currentModel(a); m != nil {
+		out["model"] = m
+	}
+	if a.State == "done" && !a.Unread {
+		a.State = "idle"
+	}
+	out["agent"] = a
+	// One stamp covers everything the session view shows.
+	pb, _ := json.Marshal(out["prompt"])
+	ab, _ := json.Marshal(a)
+	stamp := fnv(fmt.Sprintf("%s|%v|%d|%s|%s|%v|%v", a.tr.pathOrEmpty(), out["tr"], rev, ab, pb, out["mode"], out["model"]))
+	out["stamp"] = stamp
+	return out, stamp
 }
 
 // guard rejects cross-site writes: every state-changing request must carry
@@ -452,6 +579,66 @@ func guard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// compress gzips responses for clients that accept it. The event stream is
+// left alone: it is tiny, and it has to be flushed line by line.
+func compress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/events" || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Add("Vary", "Accept-Encoding")
+		gw := &gzipWriter{ResponseWriter: w}
+		defer gw.close()
+		next.ServeHTTP(gw, r)
+	})
+}
+
+var gzipPool = sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
+
+type gzipWriter struct {
+	http.ResponseWriter
+	gz      *gzip.Writer
+	decided bool
+}
+
+func (g *gzipWriter) WriteHeader(code int) {
+	if !g.decided {
+		g.decided = true
+		h := g.Header()
+		ct := h.Get("Content-Type")
+		text := strings.HasPrefix(ct, "text/") || strings.Contains(ct, "json") || strings.Contains(ct, "javascript") || strings.Contains(ct, "svg")
+		if code >= 200 && code != http.StatusNoContent && code != http.StatusNotModified && code != http.StatusPartialContent && text && h.Get("Content-Encoding") == "" {
+			h.Set("Content-Encoding", "gzip")
+			h.Del("Content-Length")
+			g.gz = gzipPool.Get().(*gzip.Writer)
+			g.gz.Reset(g.ResponseWriter)
+		}
+	}
+	g.ResponseWriter.WriteHeader(code)
+}
+
+func (g *gzipWriter) Write(b []byte) (int, error) {
+	if !g.decided {
+		if g.Header().Get("Content-Type") == "" {
+			g.Header().Set("Content-Type", http.DetectContentType(b))
+		}
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.gz != nil {
+		return g.gz.Write(b)
+	}
+	return g.ResponseWriter.Write(b)
+}
+
+func (g *gzipWriter) close() {
+	if g.gz != nil {
+		g.gz.Close()
+		g.gz.Reset(io.Discard)
+		gzipPool.Put(g.gz)
+	}
 }
 
 // submit pastes text into the agent's input and presses Return.

@@ -9,6 +9,13 @@
   --ui: "Figtree", system-ui, -apple-system, "Helvetica Neue", sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --top: env(safe-area-inset-top, 0px); --bottom: env(safe-area-inset-bottom, 0px);
+  /* Motion. d1 press, d2 small things, d3 blocks, d4 screens and sheets. The
+     spring is for whatever moves or changes size; ease for fades and exits. */
+  --d1: 100ms; --d2: 200ms; --d3: 300ms; --d4: 380ms; --press: .965;
+  --ease: cubic-bezier(.22,1,.36,1); --spring: cubic-bezier(.22,1,.36,1);
+}
+@supports (transition-timing-function: linear(0, 1)) {
+  :root { --spring: linear(0,0.022,0.079,0.159,0.25,0.346,0.442,0.532,0.616,0.691,0.758,0.814,0.862,0.902,0.934,0.959,0.979,0.994,1.004,1.012,1.016,1.019,1.02,1.02,1.019,1.017,1.016,1.014,1.012,1.01,1.008,1.007,1.005,1.004,1.003,1.002,1.002,1.001,1.001,1,1); }
 }
 .hue { --hs: oklch(0.57 0.19 var(--h)); --ht: oklch(0.935 0.05 var(--h)); --hd: oklch(0.42 0.14 var(--h)); }
 @media (prefers-color-scheme: dark) {
@@ -122,7 +129,7 @@ i { font-style: normal; }
 .steps { background: var(--sunk); border-radius: 14px; overflow: hidden; }
 .steps-h { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px; width: 100%; font-size: 13px; color: var(--ink2); }
 .steps-h b { color: var(--ink); font-weight: 600; }
-.steps-h svg, .diff-h svg { transition: transform .15s; }
+.steps-h svg, .diff-h svg { transition: transform var(--d2) var(--spring); }
 .steps.open .steps-h svg, .diff.open .diff-h svg { transform: rotate(90deg); }
 .step { display: block; width: 100%; padding: 9px 12px 9px 36px; border-top: 1px solid var(--surface); }
 .step .n { font: 600 12px/1.2 var(--ui); color: var(--ink3); }
@@ -171,12 +178,12 @@ i { font-style: normal; }
 .key.on { background: var(--ink); color: var(--on-ink); }
 
 /* model sheet */
-.scrim { position: absolute; inset: 0; z-index: 6; width: 100%; background: var(--scrim); cursor: default; animation: fade .18s ease-out; }
-.bsheet { position: absolute; left: 0; right: 0; bottom: 0; z-index: 7; max-height: 84%; display: flex; flex-direction: column; background: var(--surface); border-radius: 26px 26px 0 0; box-shadow: 0 -18px 44px -18px var(--shade); padding-bottom: max(14px, var(--bottom)); animation: rise .24s cubic-bezier(.2,.8,.2,1); }
-.scrim.still, .bsheet.still { animation: none; }
+.scrim { position: absolute; inset: 0; z-index: 6; width: 100%; background: var(--scrim); cursor: default; animation: fade var(--d3) var(--ease); }
+.bsheet { position: absolute; left: 0; right: 0; bottom: 0; z-index: 7; max-height: 84%; display: flex; flex-direction: column; background: var(--surface); border-radius: 26px 26px 0 0; box-shadow: 0 -18px 44px -18px var(--shade); padding-bottom: max(14px, var(--bottom)); animation: rise var(--d4) var(--spring); }
+.bsheet::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 120px; background: inherit; }
+.bs-h, .grab { touch-action: none; }
 @keyframes fade { from { opacity: 0; } }
-@keyframes rise { from { transform: translateY(28px); opacity: 0; } }
-@media (prefers-reduced-motion: reduce) { .scrim, .bsheet { animation: none; } }
+@keyframes rise { from { transform: translateY(100%); } }
 .grab { flex: none; width: 36px; height: 4px; border-radius: 2px; background: var(--line); margin: 8px auto 0; }
 .bs-h { flex: none; display: flex; align-items: center; gap: 2px; padding: 6px 6px 8px 20px; }
 .bs-h.back { padding-left: 6px; }
@@ -247,4 +254,93 @@ i { font-style: normal; }
 .kv { display: flex; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--line); font-weight: 600; }
 .kv span:last-child { color: var(--ink2); text-align: right; font-weight: 400; }
 .hint { font-size: 13.5px; color: var(--ink2); }
-.toast { position: absolute; left: 16px; right: 16px; bottom: calc(var(--bottom) + 150px); background: var(--ink); color: var(--on-ink); border-radius: 15px; padding: 12px 14px; font: 500 14px/1.4 var(--ui); z-index: 8; box-shadow: 0 12px 28px -12px var(--shade); }
+.toast { position: fixed; left: max(16px, calc(50% - 264px)); right: max(16px, calc(50% - 264px)); transform-origin: 50% 100%; bottom: calc(var(--bottom) + 150px); background: var(--ink); color: var(--on-ink); border-radius: 15px; padding: 12px 14px; font: 500 14px/1.4 var(--ui); z-index: 8; box-shadow: 0 12px 28px -12px var(--shade); }
+
+/* ---- motion ---- */
+
+/* 1. Answer the finger: a control sinks and tints the moment it is touched. */
+button { transition: transform var(--d2) var(--spring), box-shadow var(--d2) var(--ease), background-color var(--d2) var(--ease), color var(--d2) var(--ease), opacity var(--d2) var(--ease); }
+button.pr { transform: scale(var(--press)); box-shadow: inset 0 0 0 100vmax color-mix(in srgb, var(--ink) 9%, transparent); transition-duration: var(--d1); transition-timing-function: var(--ease); }
+:is(.item, .step, .steps-h, .diff-h, .mrow, .mi, .opt, .pick).pr { transform: scale(.985); }
+.item { border-radius: 18px; }
+.fab.pr, .send.pr, .btn.pri.pr { box-shadow: inset 0 0 0 100vmax rgba(255,255,255,.16); }
+.shade.pr, .scrim.pr { transform: none; box-shadow: none; }
+.termview button.pr { box-shadow: inset 0 0 0 100vmax rgba(255,255,255,.1); }
+.dock .send.off { background: var(--line); color: var(--ink3); transform: scale(.88); }
+.chip, .st, .pill { transition: background-color var(--d2) var(--ease), color var(--d2) var(--ease), transform var(--d2) var(--spring); }
+.view.sessionview { transition: background-color var(--d3) var(--ease); }
+.view > .sheet { position: relative; }
+
+/* 2. Show the result first: what the Mac has not confirmed yet is quieter. */
+.you { transform-origin: 100% 100%; transition: opacity var(--d3) var(--ease); }
+.you.sending { opacity: .58; }
+.opt.chosen { background: var(--hs); color: #fff; }
+.opts.answered .opt:not(.chosen) { opacity: .32; }
+.opt .tick { display: none; }
+.opt.chosen .tick { display: block; }
+.shim { background: linear-gradient(90deg, var(--ink3) 0 38%, var(--ink) 50%, var(--ink3) 62% 100%) 0 0 / 260% 100%; -webkit-background-clip: text; background-clip: text; color: transparent !important; animation: sweep 1.5s linear infinite; }
+.shim b { color: transparent !important; }
+@keyframes sweep { from { background-position: 100% 0; } to { background-position: -30% 0; } }
+
+/* 3. Move things, don't replace them. */
+.fold { display: grid; grid-template-rows: 0fr; transition: grid-template-rows var(--d3) var(--ease); }
+.open > .fold { grid-template-rows: 1fr; }
+.fold-in { min-height: 0; overflow: hidden; }
+.step .fold-in > :first-child { margin-top: 8px; }
+.menu { transform-origin: 86% 100%; }
+.latest { position: absolute; left: 50%; bottom: 12px; z-index: 2; height: 36px; padding: 0 14px 0 11px; border-radius: 999px; background: var(--ink); color: var(--on-ink); font: 600 13px/1 var(--ui); display: inline-flex; align-items: center; gap: 6px; box-shadow: 0 10px 22px -10px var(--shade); translate: -50% 0; opacity: 0; transform: translateY(14px) scale(.9); pointer-events: none; transition: opacity var(--d2) var(--ease), transform var(--d3) var(--spring); }
+.latest.show { opacity: 1; transform: none; pointer-events: auto; }
+.latest svg { transform: rotate(180deg); }
+/* The outline of what is coming, in place of a blank screen. */
+.sk { display: block; border-radius: 9px; background: linear-gradient(90deg, var(--sunk) 20%, color-mix(in srgb, var(--sunk) 45%, var(--surface)) 50%, var(--sunk) 80%) 0 0 / 220% 100%; animation: sweep 1.25s linear infinite; }
+.skel { display: flex; flex-direction: column; gap: 14px; }
+.sk-row { pointer-events: none; }
+.step .sk, .diff .sk { background: linear-gradient(90deg, var(--surface) 20%, color-mix(in srgb, var(--surface) 55%, var(--sunk)) 50%, var(--surface) 80%) 0 0 / 220% 100%; height: 12px; margin: 8px 0 4px; }
+.diff .sk { background: linear-gradient(90deg, var(--sunk) 20%, color-mix(in srgb, var(--sunk) 45%, var(--surface)) 50%, var(--sunk) 80%) 0 0 / 220% 100%; margin: 4px 12px 10px; }
+
+/* 4. Show the work. New words arrive in the project's colour and dry to ink. */
+.now .time { margin-left: auto; }
+.now.think { color: var(--ink3); }
+.agent .w, .agent .hid { display: none; }
+.agent .w.in { display: inline; animation: ink .7s var(--ease) both; }
+@keyframes ink { 0% { opacity: 0; color: var(--hs); } 45% { opacity: 1; color: var(--hs); } }
+
+/* Screen changes. Opening a session: the tapped row's tile and title travel
+   to the header, the sheet stays, the reply bar slides up. */
+:root[data-nav="open"] .view > .sheet, :root[data-nav="close"] .view > .sheet { view-transition-name: sheet; }
+:root[data-nav="open"] .sessionview .nav .av, :root[data-nav="close"] .sessionview .nav .av { view-transition-name: av; }
+:root[data-nav="open"] .sessionview .nav .ttl, :root[data-nav="close"] .sessionview .nav .ttl { view-transition-name: ttl; }
+:root[data-nav="open"] .view > .dock, :root[data-nav="close"] .view > .dock { view-transition-name: dock; }
+:root[data-nav="open"] .fab, :root[data-nav="close"] .fab { view-transition-name: fab; }
+::view-transition-group(*) { animation-duration: var(--d4); animation-timing-function: var(--spring); }
+::view-transition-old(*), ::view-transition-new(*) { animation-duration: calc(var(--d4) * .62); animation-timing-function: var(--ease); }
+::view-transition-old(ttl), ::view-transition-new(ttl) { width: auto; height: 100%; }
+::view-transition-new(dock):only-child { animation: dock-in var(--d4) var(--spring) both; }
+::view-transition-old(dock):only-child { animation: dock-out var(--d3) var(--ease) both; }
+::view-transition-new(fab):only-child { animation: fab-in var(--d4) var(--spring) both; }
+::view-transition-old(fab):only-child { animation: fab-out var(--d2) var(--ease) both; }
+@keyframes dock-in { from { transform: translateY(100%); } }
+@keyframes dock-out { to { transform: translateY(100%); } }
+@keyframes fab-in { from { transform: scale(.3); opacity: 0; } }
+@keyframes fab-out { to { transform: scale(.3); opacity: 0; } }
+/* New agent and settings rise over the list; the terminal comes in from the side. */
+:root[data-nav="up"]::view-transition-old(root), :root[data-nav="push"]::view-transition-old(root) { animation: vt-hold var(--d4) both; }
+:root[data-nav="up"]::view-transition-new(root) { animation: vt-up var(--d4) var(--ease) both; }
+:root[data-nav="down"]::view-transition-new(root), :root[data-nav="pop"]::view-transition-new(root) { animation: vt-hold var(--d3) both; }
+:root[data-nav="down"]::view-transition-old(root) { animation: vt-down var(--d3) var(--ease) both; z-index: 1; }
+:root[data-nav="push"]::view-transition-new(root) { animation: vt-in var(--d4) var(--ease) both; }
+:root[data-nav="pop"]::view-transition-old(root) { animation: vt-out var(--d3) var(--ease) both; z-index: 1; }
+@keyframes vt-hold { from { opacity: 1; } to { opacity: 1; } }
+@keyframes vt-up { from { transform: translateY(100%); } }
+@keyframes vt-down { to { transform: translateY(100%); } }
+@keyframes vt-in { from { transform: translateX(100%); } }
+@keyframes vt-out { to { transform: translateX(100%); } }
+
+@media (prefers-reduced-motion: reduce) {
+  button.pr, :is(.item, .step, .steps-h, .diff-h, .mrow, .mi, .opt, .pick).pr { transform: none; }
+  .shim, .sk { animation: none; }
+  .shim { color: var(--ink3) !important; background: none; }
+  .bsheet { animation: fade var(--d2); }
+  .fold { transition: none; }
+  .agent .w.in { animation: none; }
+}

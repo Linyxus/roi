@@ -67,7 +67,10 @@ directory, which gives a second, separate roi for testing.
 - **Inbox**: every agent pane, sorted needs-you → finished → working → idle,
   pushed live from Rex's program-status events.
 - **Session**: the conversation read from the agent's own session file, with
-  tool calls folded into steps, diffs, the plan and sub-agents.
+  tool calls folded into steps, diffs, the plan and sub-agents. The Mac
+  pushes each change as it happens and sends only what is new; a step's
+  output is fetched when you open it. What you send or choose shows at once
+  and is confirmed behind it.
 - **Prompts**: a blocked agent's choices are read off its screen and shown as
   buttons; tapping one presses that number. Typing instead presses Esc and
   sends your text.
